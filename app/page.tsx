@@ -8,8 +8,43 @@ interface GradingResponse {
   max_score: number;
   reasoning: string;
   comments: string;
-  annotated_image: string;
+  annotated: {
+    data_url: string;
+    mime_type: string;
+    file_extension: string;
+  };
   error?: string;
+}
+
+function isPdf(file: File): boolean {
+  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+}
+
+function FilePreview({ file, dataUrl }: { file: File; dataUrl: string | null }) {
+  if (!dataUrl) {
+    return <p className="mt-2 text-sm text-slate-500">📄 {file.name}</p>;
+  }
+  if (file.type.startsWith("image/")) {
+    return (
+      <img
+        src={dataUrl}
+        alt={file.name}
+        className="mt-3 max-h-64 rounded border border-slate-200"
+      />
+    );
+  }
+  if (isPdf(file)) {
+    return (
+      <object
+        data={dataUrl}
+        type="application/pdf"
+        className="mt-3 w-full h-64 rounded border border-slate-200"
+      >
+        <p className="text-sm text-slate-500">📄 {file.name}(PDFプレビュー非対応)</p>
+      </object>
+    );
+  }
+  return <p className="mt-2 text-sm text-slate-500">📄 {file.name}</p>;
 }
 
 export default function Home() {
@@ -27,7 +62,11 @@ export default function Home() {
     setPreview: (p: string | null) => void,
   ) {
     setFile(file);
-    if (file && file.type.startsWith("image/")) {
+    if (!file) {
+      setPreview(null);
+      return;
+    }
+    if (file.type.startsWith("image/") || isPdf(file)) {
       const reader = new FileReader();
       reader.onload = (e) => setPreview(e.target?.result as string);
       reader.readAsDataURL(file);
@@ -39,7 +78,7 @@ export default function Home() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!answerFile || !criteriaFile) {
-      setError("答案画像と採点基準の両方をアップロードしてください。");
+      setError("答案と採点基準の両方をアップロードしてください。");
       return;
     }
 
@@ -71,12 +110,14 @@ export default function Home() {
     }
   }
 
+  const annotatedIsPdf = result?.annotated.mime_type === "application/pdf";
+
   return (
     <main className="max-w-4xl mx-auto px-4 py-8">
       <header className="mb-8">
         <h1 className="text-3xl font-bold text-slate-900">手書き答案 自動採点</h1>
         <p className="text-slate-600 mt-2">
-          採点基準と生徒の答案画像をアップロードすると、Gemini Vision が採点して点数を画像に書き込みます。
+          採点基準と生徒の答案(画像 / PDF)をアップロードすると、Gemini Vision が採点して点数を書き込みます。
         </p>
       </header>
 
@@ -86,11 +127,11 @@ export default function Home() {
       >
         <div>
           <label className="block text-sm font-semibold text-slate-700 mb-2">
-            採点基準(画像 / .txt / .md)
+            採点基準(画像 / PDF / .txt / .md)
           </label>
           <input
             type="file"
-            accept="image/*,.txt,.md,text/plain,text/markdown"
+            accept="image/*,application/pdf,.pdf,.txt,.md,text/plain,text/markdown"
             onChange={(e) =>
               handleFileChange(
                 e.target.files?.[0] ?? null,
@@ -100,25 +141,18 @@ export default function Home() {
             }
             className="block w-full text-sm text-slate-600 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:bg-slate-100 file:text-slate-700 hover:file:bg-slate-200"
           />
-          {criteriaPreview && (
-            <img
-              src={criteriaPreview}
-              alt="採点基準プレビュー"
-              className="mt-3 max-h-48 rounded border border-slate-200"
-            />
-          )}
-          {criteriaFile && !criteriaPreview && (
-            <p className="mt-2 text-sm text-slate-500">📄 {criteriaFile.name}</p>
+          {criteriaFile && (
+            <FilePreview file={criteriaFile} dataUrl={criteriaPreview} />
           )}
         </div>
 
         <div>
           <label className="block text-sm font-semibold text-slate-700 mb-2">
-            生徒の答案(画像)
+            生徒の答案(画像 / PDF)
           </label>
           <input
             type="file"
-            accept="image/*"
+            accept="image/*,application/pdf,.pdf"
             onChange={(e) =>
               handleFileChange(
                 e.target.files?.[0] ?? null,
@@ -128,12 +162,8 @@ export default function Home() {
             }
             className="block w-full text-sm text-slate-600 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:bg-slate-100 file:text-slate-700 hover:file:bg-slate-200"
           />
-          {answerPreview && (
-            <img
-              src={answerPreview}
-              alt="答案プレビュー"
-              className="mt-3 max-h-64 rounded border border-slate-200"
-            />
+          {answerFile && (
+            <FilePreview file={answerFile} dataUrl={answerPreview} />
           )}
         </div>
 
@@ -163,18 +193,28 @@ export default function Home() {
           </div>
 
           <div>
-            <h3 className="font-semibold text-slate-700 mb-2">採点済み画像</h3>
-            <img
-              src={result.annotated_image}
-              alt="採点済み答案"
-              className="max-w-full rounded border border-slate-200"
-            />
+            <h3 className="font-semibold text-slate-700 mb-2">採点済み答案</h3>
+            {annotatedIsPdf ? (
+              <object
+                data={result.annotated.data_url}
+                type="application/pdf"
+                className="w-full h-[600px] rounded border border-slate-200"
+              >
+                <p className="text-sm text-slate-500">PDFプレビューは表示できません。下のリンクからダウンロードしてください。</p>
+              </object>
+            ) : (
+              <img
+                src={result.annotated.data_url}
+                alt="採点済み答案"
+                className="max-w-full rounded border border-slate-200"
+              />
+            )}
             <a
-              href={result.annotated_image}
-              download="graded.jpg"
+              href={result.annotated.data_url}
+              download={`graded.${result.annotated.file_extension}`}
               className="inline-block mt-2 text-sm text-blue-600 hover:underline"
             >
-              ⬇ 画像をダウンロード
+              ⬇ {annotatedIsPdf ? "PDFをダウンロード" : "画像をダウンロード"}
             </a>
           </div>
 

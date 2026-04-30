@@ -7,6 +7,7 @@ export const gradingResultSchema = z.object({
   reasoning: z.string(),
   comments: z.string(),
   score_box: z.object({
+    page_number: z.number().int().min(1),
     x: z.number().min(0).max(1),
     y: z.number().min(0).max(1),
   }),
@@ -35,16 +36,23 @@ export const responseSchemaForGemini = {
     score_box: {
       type: "object",
       properties: {
+        page_number: {
+          type: "integer",
+          description:
+            "点数を記入する空欄があるページ番号(1から始まる)。画像入力の場合は1。複数ページPDFで点数欄が複数ある場合は、最も適切なページを指定。",
+        },
         x: {
           type: "number",
-          description: "点数欄中心の x 座標(画像左端=0、右端=1)",
+          description:
+            "点数欄中心の x 座標(該当ページ内で正規化、左端=0、右端=1)",
         },
         y: {
           type: "number",
-          description: "点数欄中心の y 座標(画像上端=0、下端=1)",
+          description:
+            "点数欄中心の y 座標(該当ページ内で正規化、上端=0、下端=1)",
         },
       },
-      required: ["x", "y"],
+      required: ["page_number", "x", "y"],
     },
   },
   required: [

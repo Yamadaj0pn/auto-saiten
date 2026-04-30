@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { gradeAnswer, type CriteriaInput } from "@/lib/gemini";
-import { annotateScore } from "@/lib/annotate";
+import { annotateAnswer } from "@/lib/annotate";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -15,8 +15,25 @@ const IMAGE_MIME_TYPES = new Set([
 const TEXT_MIME_TYPES = new Set([
   "text/plain",
   "text/markdown",
-  "application/octet-stream",
 ]);
+
+function detectMimeType(file: File): string {
+  if (file.type && file.type !== "application/octet-stream") {
+    return file.type;
+  }
+  const name = file.name.toLowerCase();
+  if (name.endsWith(".pdf")) return "application/pdf";
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+  if (name.endsWith(".png")) return "image/png";
+  if (name.endsWith(".webp")) return "image/webp";
+  if (name.endsWith(".txt")) return "text/plain";
+  if (name.endsWith(".md")) return "text/markdown";
+  return file.type || "application/octet-stream";
+}
+
+function isAnswerType(mimeType: string): boolean {
+  return IMAGE_MIME_TYPES.has(mimeType) || mimeType === "application/pdf";
+}
 
 async function fileToBase64(file: File): Promise<string> {
   const arrayBuffer = await file.arrayBuffer();
@@ -36,32 +53,38 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (!IMAGE_MIME_TYPES.has(answerFile.type)) {
+    const answerMimeType = detectMimeType(answerFile);
+    const criteriaMimeType = detectMimeType(criteriaFile);
+
+    if (!isAnswerType(answerMimeType)) {
       return NextResponse.json(
-        { error: `答案は画像ファイル(JPEG/PNG/WebP)である必要があります。受信: ${answerFile.type}` },
+        {
+          error: `答案は画像(JPEG/PNG/WebP)または PDF である必要があります。受信: ${answerMimeType}`,
+        },
         { status: 400 },
       );
     }
 
     let criteria: CriteriaInput;
-    if (IMAGE_MIME_TYPES.has(criteriaFile.type)) {
-      criteria = {
-        kind: "image",
-        data: await fileToBase64(criteriaFile),
-        mimeType: criteriaFile.type,
-      };
-    } else if (
-      TEXT_MIME_TYPES.has(criteriaFile.type) ||
-      criteriaFile.name.endsWith(".txt") ||
-      criteriaFile.name.endsWith(".md")
+    if (
+      IMAGE_MIME_TYPES.has(criteriaMimeType) ||
+      criteriaMimeType === "application/pdf"
     ) {
+      criteria = {
+        kind: "file",
+        data: await fileToBase64(criteriaFile),
+        mimeType: criteriaMimeType,
+      };
+    } else if (TEXT_MIME_TYPES.has(criteriaMimeType)) {
       criteria = {
         kind: "text",
         content: await criteriaFile.text(),
       };
     } else {
       return NextResponse.json(
-        { error: `採点基準は画像またはテキストファイルである必要があります。受信: ${criteriaFile.type}` },
+        {
+          error: `採点基準は画像 / PDF / テキストファイルである必要があります。受信: ${criteriaMimeType}`,
+        },
         { status: 400 },
       );
     }
@@ -70,23 +93,29 @@ export async function POST(request: NextRequest) {
     const answerBuffer = Buffer.from(answerArrayBuffer);
 
     const result = await gradeAnswer({
-      answerImage: {
+      answer: {
+        kind: "file",
         data: answerBuffer.toString("base64"),
-        mimeType: answerFile.type,
+        mimeType: answerMimeType,
       },
       criteria,
     });
 
-    const annotatedBuffer = await annotateScore(
+    const annotated = await annotateAnswer(
       answerBuffer,
+      answerMimeType,
       result.score,
       result.score_box,
     );
-    const annotatedBase64 = annotatedBuffer.toString("base64");
+    const annotatedDataUrl = `data:${annotated.mimeType};base64,${annotated.buffer.toString("base64")}`;
 
     return NextResponse.json({
       ...result,
-      annotated_image: `data:image/jpeg;base64,${annotatedBase64}`,
+      annotated: {
+        data_url: annotatedDataUrl,
+        mime_type: annotated.mimeType,
+        file_extension: annotated.fileExtension,
+      },
     });
   } catch (error) {
     console.error("Grading error:", error);
