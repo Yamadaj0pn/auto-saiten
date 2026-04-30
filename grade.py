@@ -1,16 +1,17 @@
-"""手書き答案を Claude Vision で採点し、点数を画像に書き込むツール。"""
+"""手書き答案を Gemini Vision で採点し、点数を画像に書き込むツール。"""
 
 from __future__ import annotations
 
 import argparse
-import base64
+import os
 from pathlib import Path
 
-import anthropic
+from google import genai
+from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
-IMAGE_EXT_TO_MEDIA = {
+IMAGE_EXT_TO_MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
@@ -32,8 +33,8 @@ JAPANESE_FONT_CANDIDATES = [
 class ScoreBox(BaseModel):
     """答案画像内の点数記入欄の中心座標(画像サイズで正規化、0〜1)。"""
 
-    x: float = Field(ge=0.0, le=1.0, description="点数欄中心の x 座標(画像左端=0、右端=1)")
-    y: float = Field(ge=0.0, le=1.0, description="点数欄中心の y 座標(画像上端=0、下端=1)")
+    x: float = Field(description="点数欄中心の x 座標(画像左端=0、右端=1)")
+    y: float = Field(description="点数欄中心の y 座標(画像上端=0、下端=1)")
 
 
 class GradingResult(BaseModel):
@@ -57,86 +58,69 @@ class GradingResult(BaseModel):
     )
 
 
-def encode_image(path: Path) -> tuple[str, str]:
-    suffix = path.suffix.lower()
-    if suffix not in IMAGE_EXT_TO_MEDIA:
-        raise ValueError(f"非対応の画像形式: {suffix}")
-    media_type = IMAGE_EXT_TO_MEDIA[suffix]
-    data = base64.standard_b64encode(path.read_bytes()).decode("utf-8")
-    return media_type, data
-
-
-def build_user_content(answer_path: Path, criteria_path: Path) -> list[dict]:
-    content: list[dict] = []
-
-    content.append({"type": "text", "text": "【採点基準】"})
-    if criteria_path.suffix.lower() in IMAGE_EXT_TO_MEDIA:
-        media_type, data = encode_image(criteria_path)
-        content.append(
-            {
-                "type": "image",
-                "source": {"type": "base64", "media_type": media_type, "data": data},
-                "cache_control": {"type": "ephemeral"},
-            }
-        )
-    else:
-        criteria_text = criteria_path.read_text(encoding="utf-8")
-        content.append(
-            {
-                "type": "text",
-                "text": criteria_text,
-                "cache_control": {"type": "ephemeral"},
-            }
-        )
-
-    content.append({"type": "text", "text": "\n【生徒の答案】"})
-    media_type, data = encode_image(answer_path)
-    content.append(
-        {
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": data},
-        }
-    )
-
-    content.append(
-        {
-            "type": "text",
-            "text": (
-                "上の答案を採点基準に従って採点してください。\n"
-                "- 答案の手書き部分を正確に読み取り、模範解答と照合する\n"
-                "- 採点基準に部分点のルールがあればそれに従い、明示されていない場合も"
-                "意味的に正しい部分には部分点を与える\n"
-                "- スペルミス・文法ミスは採点基準に従って減点する\n"
-                "- score_box は、答案画像内の「点数を記入する空欄(例: 『 /8点』のような枠)」の"
-                "中心位置を正規化座標で返す。点数欄が見つからない場合は右下付近の妥当な位置を返す\n"
-                "- reasoning は配点の内訳を具体的に書く\n"
-                "- comments は生徒に向けた建設的なフィードバックにする"
-            ),
-        }
-    )
-    return content
-
-
 SYSTEM_PROMPT = (
     "あなたは経験豊富な日本の学校教員で、手書き答案の採点を担当します。"
     "提示された採点基準に厳密に従って公平に採点し、根拠を明確に示してください。"
     "答案画像は手書きのため、文字認識は丁寧に行ってください。"
 )
 
+GRADING_INSTRUCTION = (
+    "上の答案を採点基準に従って採点してください。\n"
+    "- 答案の手書き部分を正確に読み取り、模範解答と照合する\n"
+    "- 採点基準に部分点のルールがあればそれに従い、明示されていない場合も"
+    "意味的に正しい部分には部分点を与える\n"
+    "- スペルミス・文法ミスは採点基準に従って減点する\n"
+    "- score_box は、答案画像内の「点数を記入する空欄(例: 『 /8点』のような枠)」の"
+    "中心位置を正規化座標で返す。点数欄が見つからない場合は右下付近の妥当な位置を返す\n"
+    "- reasoning は配点の内訳を具体的に書く\n"
+    "- comments は生徒に向けた建設的なフィードバックにする"
+)
+
+
+def load_image_part(path: Path) -> types.Part:
+    suffix = path.suffix.lower()
+    if suffix not in IMAGE_EXT_TO_MIME:
+        raise ValueError(f"非対応の画像形式: {suffix}")
+    return types.Part.from_bytes(data=path.read_bytes(), mime_type=IMAGE_EXT_TO_MIME[suffix])
+
+
+def build_contents(answer_path: Path, criteria_path: Path) -> list:
+    parts: list = []
+    parts.append("【採点基準】")
+    if criteria_path.suffix.lower() in IMAGE_EXT_TO_MIME:
+        parts.append(load_image_part(criteria_path))
+    else:
+        parts.append(criteria_path.read_text(encoding="utf-8"))
+    parts.append("\n【生徒の答案】")
+    parts.append(load_image_part(answer_path))
+    parts.append(GRADING_INSTRUCTION)
+    return parts
+
 
 def grade(answer_path: Path, criteria_path: Path, model: str) -> GradingResult:
-    client = anthropic.Anthropic()
-    response = client.messages.parse(
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise SystemExit("環境変数 GEMINI_API_KEY を設定してください。")
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
         model=model,
-        max_tokens=8192,
-        thinking={"type": "adaptive"},
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": build_user_content(answer_path, criteria_path)}],
-        output_format=GradingResult,
+        contents=build_contents(answer_path, criteria_path),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=GradingResult,
+        ),
     )
-    if response.parsed_output is None:
-        raise RuntimeError(f"採点結果のパースに失敗しました。stop_reason={response.stop_reason}")
-    return response.parsed_output
+
+    parsed = response.parsed
+    if parsed is None:
+        raise RuntimeError(
+            f"採点結果のパースに失敗しました。レスポンス: {response.text!r}"
+        )
+    if isinstance(parsed, GradingResult):
+        return parsed
+    return GradingResult.model_validate(parsed)
 
 
 def load_japanese_font(size: int) -> ImageFont.ImageFont:
@@ -185,7 +169,7 @@ def write_report(answer_path: Path, result: GradingResult, out_path: Path) -> No
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="手書き答案を Claude Vision で自動採点する。")
+    parser = argparse.ArgumentParser(description="手書き答案を Gemini Vision で自動採点する。")
     parser.add_argument("--answer", required=True, type=Path, help="答案画像のパス")
     parser.add_argument(
         "--criteria",
@@ -194,7 +178,11 @@ def main() -> None:
         help="採点基準(画像 .png/.jpg または テキスト .txt/.md)",
     )
     parser.add_argument("--out-dir", default=Path("output"), type=Path, help="出力先ディレクトリ")
-    parser.add_argument("--model", default="claude-opus-4-7", help="使用モデル")
+    parser.add_argument(
+        "--model",
+        default="gemini-2.5-pro",
+        help="使用する Gemini モデル(例: gemini-2.5-pro, gemini-2.5-flash)",
+    )
     args = parser.parse_args()
 
     if not args.answer.exists():
